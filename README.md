@@ -1,2 +1,3 @@
 # WARP
 WARP: A Unified Framework for Error-Bounded Time Series Compression Based on Window-Adaptive And Residual Prediction
+We currently provide a partial release of the core implementation to facilitate the verification of the proposed method and the main experimental results. This release contains the essential compression modules and selected experimental scripts. The complete source code is withheld during the review stage to preserve the integrity of the submission process. After the paper is accepted, we will release the full implementation, together with the complete experimental pipeline and configuration files, in a public GitHub repository.
