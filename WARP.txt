@@ -1,0 +1,1835 @@
+package io.github.xkitsios;
+
+import com.github.luben.zstd.Zstd;
+
+import java.io.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class WARP {
+
+    private static double epsilon;
+    private static long lastTimeStamp;
+    private static int zigZagEncode(int v) { return (v << 1) ^ (v >> 31); }
+    private static int zigZagDecode(int u) { return (u >>> 1) ^ -(u & 1); }
+
+
+
+
+    private static final int VALLEY_GUARD_MAX_W = 16_384;
+    private static final double VALLEY_GUARD_MARGIN = 0.01; // 1%
+
+
+    static final int N_MIN = Integer.getInteger("gate.nMin", 5);
+    static final double DELTA_WAP = Double.parseDouble(System.getProperty("gate.deltaWap", "0.02"));
+    static final double DELTA_MIX = Double.parseDouble(System.getProperty("gate.deltaMix", "0.05"));
+    static final double CONFIDENCE_Z = 1.96;   // 仅在 ciMethod=normal 时使用
+    static final double CONFIDENCE_LEVEL =
+            Double.parseDouble(System.getProperty("gate.confLevel", "0.95"));
+    static final int BOOTSTRAP_REPS = Integer.getInteger("gate.bootstrapReps", 2000);。
+
+    static final String CI_METHOD = System.getProperty("gate.ciMethod", "student").toLowerCase();
+    static final int MAX_BOOTSTRAP_SAMPLES = 512;
+
+
+    static final String EPS_SCALE_MODE = System.getProperty("warp.epsScale", "range").toLowerCase();
+
+
+    static final double OBS_RADIUS = 1.0;
+
+    public static final class SelectorDecision {
+        public final String decision;   // "ONLY_WAP" | "ONLY_MIX" | "BOTH"
+        public final boolean explore;
+        public SelectorDecision(String decision, boolean explore) {
+            this.decision = decision;
+            this.explore = explore;
+        }
+    }
+
+
+    public static synchronized void setRandomSeed(long seed) {
+        RNG.setSeed(seed);
+    }
+
+
+    private static boolean strictEpsilon = true;
+
+
+    public static synchronized void setStrictEpsilon(boolean v) {
+        strictEpsilon = v;
+    }
+
+
+    public static boolean strictEpsilon() {
+        return strictEpsilon;
+    }
+
+
+    private static void checkInput(List<Point> points, double error) throws Exception {
+        if (points == null || points.isEmpty() || error <= 0
+                || (strictEpsilon && !Double.isFinite(error))) {
+            throw new Exception("Invalid input or epsilon: epsilon=" + error);
+        }
+    }
+
+
+    public static String gateSettings() {
+        return "nMin=" + N_MIN + ";deltaWap=" + DELTA_WAP + ";deltaMix=" + DELTA_MIX
+                + ";confLevel=" + CONFIDENCE_LEVEL + ";exploreP=" + EXPLORE_P
+                + ";ciMethod=" + CI_METHOD;
+    }
+    public static int gateNMin()        { return N_MIN; }
+    public static double gateDeltaWap()  { return DELTA_WAP; }
+    public static double gateDeltaMix()  { return DELTA_MIX; }
+    public static double gateConfLevel() { return CONFIDENCE_LEVEL; }
+    public static double gateExploreP()  { return EXPLORE_P; }
+    public static String gateCiMethod()  { return CI_METHOD; }
+
+
+    public static final class ShadowResult {
+        public final String decision;        // ONLY_WAP | ONLY_MIX | BOTH
+        public final boolean explore;
+        public final int wapBytes;           // WAP-SRC 完整输出字节
+        public final int mixBytes;           // Mix 分支完整输出字节（含 4 字节容器头）
+        public final int chosenBytes;        // 策略实际提交的输出字节
+        public final boolean dualExecuted;   // 是否真的双跑
+        public ShadowResult(String decision, boolean explore, int wapBytes, int mixBytes,
+                            int chosenBytes, boolean dualExecuted) {
+            this.decision = decision; this.explore = explore;
+            this.wapBytes = wapBytes; this.mixBytes = mixBytes;
+            this.chosenBytes = chosenBytes; this.dualExecuted = dualExecuted;
+        }
+    }
+
+
+    
+    private static final Random RNG = new Random(42);
+    static int align128Down(int x) { return (x / 128) * 128; }
+    static int align128Up(int x)   { return ((x + 127) / 128) * 128; }
+
+    static final java.util.concurrent.ConcurrentHashMap<BucketKey, BucketStat> MODEL = new java.util.concurrent.ConcurrentHashMap<>();
+    public static synchronized void resetOnlineState() {
+        MODEL.clear();
+        RNG.setSeed(42L);
+
+        System.out.printf(
+                "[WARP] Online state reset: buckets=%d, randomSeed=%d%n",
+                MODEL.size(), 42L
+        );
+    }
+
+
+
+    public static final int ZSTD_LEGACY = Integer.MIN_VALUE;
+
+
+    private static final int MODE_BASE_MASK = 0x03; // 0=掩码，1=稀疏，2=全零
+    private static final int MODE_ZERO      = 0x02;
+
+    private static final int FLAG_CARRY_RLS = 0x80; // 跨窗继承 RLS（phi/P 不重置）
+
+    private static final int FLAG4_PRED_DELTA = 0x40;
+
+    private static final byte[] MAGIC_MIX1 = new byte[]{'M','I','X','1'};
+
+    private static final byte[] MAGIC_WAPSRC = new byte[]{'A','R','M','4'};
+    private static final byte[] MAGIC_GZRC = new byte[]{'A','R','M','Z'};
+
+    // WAP-SRC 记录标志（低2位仍为 base 模式：0=掩码 1=稀疏 2=全零）
+    private static final int FLAG4_HAS_TS   = 0x08;  // 本记录携带 startTs（否则隐式顺延）
+    private static final int FLAG4_HAS_LEN  = 0x10;  // 本记录携带 len（否则隐式为 W）
+    private static final int FLAG4_ZERO_RLE = 0x20;  // zero 窗口跨窗 RLE，后跟 runLen（单位：窗）
+
+
+    private static final AtomicInteger CODEC_TSEQ = new AtomicInteger(1);
+    private static final int CODEC_POOL_SIZE =
+            Math.max(2, Math.min(8, Runtime.getRuntime().availableProcessors()));
+    private static final ExecutorService CODEC_EXEC =
+            Executors.newFixedThreadPool(CODEC_POOL_SIZE, r -> {
+                Thread t = new Thread(r, "codec-exec-" + CODEC_TSEQ.getAndIncrement());
+                t.setDaemon(true);
+                return t;
+            });
+
+    // 小工具结构与比较
+    public static final class WBpp {
+        public final int W; public final double bpp;
+        public WBpp(int W, double bpp) { this.W = W; this.bpp = bpp; }
+    }
+    static class EvalAgg {
+        long bytesHeader, bytesBody, ptsCount;
+        long startTsBytesSum, lenBytesSum;
+        int sampled;
+    }
+
+    private static WBpp selectBest(List<WBpp> results) {
+        if (results == null || results.isEmpty()) return null;
+        double minBpp = Double.POSITIVE_INFINITY;
+        for (WBpp r : results) {
+            if (r != null && r.bpp < minBpp) minBpp = r.bpp;
+        }
+        if (!(minBpp < Double.POSITIVE_INFINITY)) {
+            // 所有候选都无法评估（bpp = +Inf）：退化为取最大窗口，与旧行为一致
+            WBpp widest = null;
+            for (WBpp r : results) {
+                if (r != null && (widest == null || r.W > widest.W)) widest = r;
+            }
+            return widest;
+        }
+        double tieLimit = minBpp / (1.0 - TIE_RATIO);
+        WBpp best = null;
+        for (WBpp r : results) {
+            // !(<=) 同时排除 NaN
+            if (r == null || !(r.bpp <= tieLimit)) continue;
+            if (best == null || r.W > best.W) best = r; // 打平时取更大 W
+        }
+        return best;
+    }
+    static final int PROBE_K = 4096;          // Mix 前缀探测长度
+    // 探索概率：小概率强制双跑来更新模型。可配置（审稿 R1.4 敏感性分析）。
+    static final double EXPLORE_P = Double.parseDouble(System.getProperty("gate.exploreP", "0.05"));
+    static class SuggestStats {
+        final int W;
+        final boolean evenlySpaced;
+        final double rho;
+        final double nzRateDelta;
+        final double nzRateRls;
+        final boolean sparseFastPath; // 对应 suggestW 里直接 return maxW 的那条分支
+        SuggestStats(int W, boolean evenlySpaced, double rho, double nzRateDelta, double nzRateRls, boolean sparseFastPath) {
+            this.W = W; this.evenlySpaced = evenlySpaced; this.rho = rho;
+            this.nzRateDelta = nzRateDelta; this.nzRateRls = nzRateRls;
+            this.sparseFastPath = sparseFastPath;
+        }
+    }
+
+    static class MixProbeStats {
+        final int k;
+        final int segCount;
+        final int uniqueB;
+        final int uniqueSlope;
+        MixProbeStats(int k, int segCount, int uniqueB, int uniqueSlope) {
+            this.k = k; this.segCount = segCount; this.uniqueB = uniqueB; this.uniqueSlope = uniqueSlope;
+        }
+        double segRate() { return segCount / (double) k; }
+        double uniqueBRate() { return uniqueB / (double) Math.max(1, segCount); }
+        double uniqueSlopeRate() { return uniqueSlope / (double) Math.max(1, segCount); }
+    }
+
+    enum GateDecision { ONLY_MIX, ONLY_WAP, BOTH }
+
+
+
+    static class BucketKey {
+        final int rhoBin, nzBin, segBin, evenBin, epsBin;
+
+        BucketKey(int rhoBin, int nzBin, int segBin, int evenBin, int epsBin) {
+            this.rhoBin = rhoBin;
+            this.nzBin = nzBin;
+            this.segBin = segBin;
+            this.evenBin = evenBin;
+            this.epsBin = epsBin;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (!(o instanceof BucketKey)) return false;
+            BucketKey k = (BucketKey) o;
+            return rhoBin == k.rhoBin && nzBin == k.nzBin && segBin == k.segBin
+                    && evenBin == k.evenBin && epsBin == k.epsBin;
+        }
+
+        @Override
+        public int hashCode() {
+            int h = 17;
+            h = 31 * h + rhoBin;
+            h = 31 * h + nzBin;
+            h = 31 * h + segBin;
+            h = 31 * h + evenBin;
+            h = 31 * h + epsBin;
+            return h;
+        }
+
+        @Override
+        public String toString() {
+            return String.format("BucketKey{ρ=%d, nz=%d, seg=%d, even=%d, eps=%d}",
+                    rhoBin, nzBin, segBin, evenBin, epsBin);
+        }
+    }
+
+    static final class BucketSnapshot {
+        final long n;
+        final double mean;
+        final double std;
+        BucketSnapshot(long n, double mean, double std) {
+            this.n = n;
+            this.mean = mean;
+            this.std = std;
+        }
+    }
+
+    static class BucketStat {
+        long n = 0;
+        double mean = 0;
+        double m2 = 0;
+        // 保留原始观测，用于 bootstrap 置信区间（审稿 R1.4：正态近似不成立）
+        final ArrayList<Double> samples = new ArrayList<>();
+        synchronized void update(double x) {
+            n++;
+            double delta = x - mean;
+            mean += delta / n;
+            double delta2 = x - mean;
+            m2 += delta * delta2;
+            if (samples.size() < MAX_BOOTSTRAP_SAMPLES) samples.add(x);
+        }
+        synchronized BucketSnapshot snapshot() {
+            double s = n < 2 ? Double.POSITIVE_INFINITY : Math.sqrt(Math.max(1e-9, m2 / (n - 1)));
+            return new BucketSnapshot(n, mean, s);
+        }
+        synchronized long count() { return n; }
+        synchronized double mean() { return mean; }
+        synchronized double std() {
+            if (n < 2) return Double.POSITIVE_INFINITY;
+            double var = m2 / (n - 1);
+            return Math.sqrt(Math.max(1e-9, var));
+        }
+
+        synchronized double[] rawSamples() {
+            double[] a = new double[samples.size()];
+            for (int i = 0; i < a.length; i++) a[i] = samples.get(i);
+            return a;
+        }
+   
+        static double quantile(double[] sorted, double q) {
+            if (sorted.length == 0) return Double.NaN;
+            if (sorted.length == 1) return sorted[0];
+            double pos = q * (sorted.length - 1);
+            int lo = (int) Math.floor(pos);
+            int hi = (int) Math.ceil(pos);
+            if (lo == hi) return sorted[lo];
+            double frac = pos - lo;
+            return sorted[lo] * (1 - frac) + sorted[hi] * frac;
+        }
+
+        synchronized double[] bootstrapCI(double alpha, int reps, long seed) {
+            double[] x = rawSamples();
+            int m = x.length;
+            if (m < 2) return null;
+            java.util.Random rnd = new java.util.Random(seed);
+            double[] means = new double[reps];
+            double[] buf = new double[m];
+            for (int r = 0; r < reps; r++) {
+                for (int i = 0; i < m; i++) buf[i] = x[rnd.nextInt(m)];
+                double s = 0;
+                for (int i = 0; i < m; i++) s += buf[i];
+                means[r] = s / m;
+            }
+            java.util.Arrays.sort(means);
+            double lo = quantile(means, alpha / 2.0);
+            double hi = quantile(means, 1.0 - alpha / 2.0);
+            return new double[]{lo, hi};
+        }
+    }
+
+
+    static BucketKey featurize(
+            SuggestStats s,
+            MixProbeStats m,
+            double epsilonPct
+    ) {
+        // 1. 精度分桶 (合并为 4 级以加速模型收敛)
+        int epsBin;
+        if (epsilonPct < 0.15)      epsBin = 0;
+        else if (epsilonPct < 0.35) epsBin = 1;
+        else if (epsilonPct < 0.55) epsBin = 2;
+        else                        epsBin = 3;
+
+        // 2. 超高相关性细化
+        int rhoBin;
+        if (s.rho < 0.9)        rhoBin = (int)(s.rho * 10);
+        else if (s.rho < 0.99)   rhoBin = 10; // 0.90 - 0.99
+        else if (s.rho < 0.999)  rhoBin = 11; // 0.99 - 0.999 (SPX 常见)
+        else                     rhoBin = 12; // 0.999+ (BTC/Pressure 常见)
+
+        // 3. 非零率细化 (万分位级感知)
+        double nz = Math.min(s.nzRateDelta, s.nzRateRls);
+        int nzBin = (nz < 0.001) ? 0 : (nz < 0.005) ? 1 : (nz < 0.02) ? 2 : 3;
+
+        // 4. 分段率分桶 (修复你之前 m.segBin() 的报错)
+        double sr = m.segRate();
+        int segBin = (sr < 0.005) ? 0 : (sr < 0.02) ? 1 : (sr < 0.1) ? 2 : 3;
+
+        return new BucketKey(rhoBin, nzBin, segBin, s.evenlySpaced ? 1 : 0, epsBin);
+    }
+
+
+
+
+    static MixProbeStats mixProbe(List<Point> points, double epsilon, int k) {
+        int K = Math.min(points.size(), k);
+        if (K <= 2) return new MixProbeStats(K, Math.max(1, K-1), 1, 1);
+
+        java.util.HashSet<Integer> bSet = new java.util.HashSet<>();
+        java.util.HashSet<Integer> slopeSet = new java.util.HashSet<>();
+
+        int segCount = 0;
+        int idx = 0;
+        while (idx < K) {
+            // 复制你 createSegment 的核心思想：ceil / floor 两次，取更长
+            Seg segCeil = createSegProbe(points, idx, K, epsilon, 1);
+            Seg segFloor = createSegProbe(points, idx, K, epsilon, 2);
+
+            Seg chosen;
+            if (segCeil.nextIdx > segFloor.nextIdx) chosen = segCeil;
+            else if (segCeil.nextIdx < segFloor.nextIdx) chosen = segFloor;
+            else {
+                double v0 = points.get(idx).getValue();
+                chosen = (Math.round(v0 / epsilon) == Math.ceil(v0 / epsilon)) ? segFloor : segCeil;
+            }
+
+            segCount++;
+            bSet.add(chosen.bQ);
+            slopeSet.add(chosen.aQ);
+
+            idx = chosen.nextIdx;
+        }
+
+        return new MixProbeStats(K, segCount, bSet.size(), slopeSet.size());
+    }
+
+    static class Seg {
+        final int nextIdx;
+        final int bQ; // quantized b/epsilon as int
+        final int aQ; // quantized slope bucket
+        Seg(int nextIdx, int bQ, int aQ) { this.nextIdx = nextIdx; this.bQ = bQ; this.aQ = aQ; }
+    }
+
+    static double quantizeB(double value, double epsilon, int mode) {
+        if (mode == 1) return Math.ceil(value / epsilon) * epsilon;
+        if (mode == 2) return Math.floor(value / epsilon) * epsilon;
+        return Math.round(value / epsilon) * epsilon;
+    }
+
+    static Seg createSegProbe(List<Point> pts, int start, int endExclusive, double epsilon, int qMode) {
+        long t0 = pts.get(start).getTimestamp();
+        double b = quantizeB(pts.get(start).getValue(), epsilon, qMode);
+        int bQ = (int)Math.round(b / epsilon);
+
+        if (start + 1 >= endExclusive) {
+            return new Seg(start + 1, bQ, 0);
+        }
+
+        long t1 = pts.get(start + 1).getTimestamp();
+        double v1 = pts.get(start + 1).getValue();
+        double aMax = ((v1 + epsilon) - b) / (double)(t1 - t0);
+        double aMin = ((v1 - epsilon) - b) / (double)(t1 - t0);
+
+        int idx = start + 2;
+        for (; idx < endExclusive; idx++) {
+            long ti = pts.get(idx).getTimestamp();
+            double vi = pts.get(idx).getValue();
+
+            double up = vi + epsilon;
+            double down = vi - epsilon;
+
+            double upLim = aMax * (ti - t0) + b;
+            double downLim = aMin * (ti - t0) + b;
+            if (down > upLim || up < downLim) break;
+
+            if (up < upLim) aMax = Math.max((up - b) / (double)(ti - t0), aMin);
+            if (down > downLim) aMin = Math.min((down - b) / (double)(ti - t0), aMax);
+        }
+
+        // slope 取区间中点，并做粗量化（避免哈希爆炸）
+        double aMid = 0.5 * (aMin + aMax);
+        int aQ = (int)Math.round(aMid * 1000.0); // 1e-3 精度桶；你也可按 dt/epsilon 自适应
+
+        return new Seg(idx, bQ, aQ);
+    }
+
+    static SuggestStats suggestWStats(List<Point> points, double error, double lambda, Integer wOverride) {
+        int n = points.size();
+
+        // 快速计算核心特征 (限制采样点数以保证性能)
+        int checkN = Math.min(n, 8192);
+        long[] dtBox = new long[1];
+        boolean evenly = quasiEvenlySpaced(points, 0.98, checkN, dtBox);
+        double rho = lag1Rho(points, checkN);
+
+        // 估算残差非零率
+        int probeLen = Math.min(n, 20000);
+        double nzD = estimateNzRateDelta(points, error, probeLen);
+        double nzR = estimateNzRate(points, error, 128, lambda);
+
+        int W = (wOverride != null && wOverride > 0) ? wOverride : suggestW(points, error, lambda);
+
+        // W=maxW 时视为快速路径
+        boolean fast = (nzR < SPARSE_NZRATE * 2) || (nzD < 0.02) || (W >= n * 0.9);
+
+        return new SuggestStats(W, evenly, rho, nzD, nzR, fast);
+    }
+
+
+// =========================
+// 6) 改进版 compressAuto
+// =========================
+
+    public static byte[] compressAuto(List<Point> points, double error, Integer wOverride) throws Exception {
+        return compressAuto(points, error, wOverride, ZSTD_LEGACY);
+    }
+
+    public static byte[] compressAuto(List<Point> points, double error, Integer wOverride, int zstdLevel) throws Exception {
+        checkInput(points, error);
+        final double lambda = 0.99;
+
+        // 计算值域，用于将绝对 error 转为百分比（供模型分桶使用）
+        double dataRange = computeEpsScale(points);
+        double epsPct = (dataRange > 0) ? (error / dataRange) * 100.0 : 0.0;
+
+        // ---- Stage A: 预处理 ----
+        SuggestStats s = suggestWStats(points, error, lambda, wOverride);
+        MixProbeStats m = mixProbe(points, error, PROBE_K);
+
+        // ---- Stage B: 门控 ----
+
+        System.out.printf(
+                "[compressAuto] stats: even=%s rho=%.4f nzD=%.4f nzR=%.4f fast=%s | segRate=%.6f uB=%.4f uS=%.4f%n",
+                s.evenlySpaced, s.rho, s.nzRateDelta, s.nzRateRls, s.sparseFastPath,
+                m.segRate(), m.uniqueBRate(), m.uniqueSlopeRate()
+        );
+
+
+
+        // 固定种子探索：强制双跑来更新模型
+        boolean explore = RNG.nextDouble() < EXPLORE_P;
+        GateDecision d = explore ? GateDecision.BOTH : modelPredict(s, m, epsPct);
+        System.out.println("[compressAuto] modelPredict=" + d + ", explore=" + explore);
+
+
+        // ---- Stage C: 执行 ----
+        if (d == GateDecision.ONLY_MIX) {
+            byte[] inner = MixCodec.compressMix(points, error, zstdLevel);
+            ByteArrayOutputStream out = new ByteArrayOutputStream(inner.length + 4);
+            out.write(MAGIC_MIX1);
+            out.write(inner);
+            return out.toByteArray();
+        }
+
+        if (d == GateDecision.ONLY_WAP) {
+            int W = s.W;
+            return compress_WAPSRC(points, error, W, zstdLevel);
+        }
+
+        // ---- 灰区：双跑回退（保持你当前 oracle 选择逻辑）----
+
+        System.out.println("[compressAuto] DUAL-RUN triggered.");
+
+        CompletableFuture<byte[]> mixF = CompletableFuture.supplyAsync(() -> {
+            try {
+                byte[] inner = MixCodec.compressMix(points, error, zstdLevel);
+                ByteArrayOutputStream out = new ByteArrayOutputStream(inner.length + 4);
+                out.write(MAGIC_MIX1);
+                out.write(inner);
+                return out.toByteArray();
+            } catch (Exception e) {
+                throw new CompletionException(e);
+            }
+        }, CODEC_EXEC);
+
+        CompletableFuture<byte[]> wapsrcF = CompletableFuture.supplyAsync(() -> {
+            try {
+                return compress_WAPSRC(points, error, s.W, zstdLevel);
+            } catch (Exception e) {
+                throw new CompletionException(e);
+            }
+        }, CODEC_EXEC);
+
+        byte[] a4 = null, mx = null;
+        Throwable e4 = null, em = null;
+        try { a4 = wapsrcF.join(); } catch (CompletionException ce) { e4 = ce.getCause(); }
+        try { mx = mixF.join();  } catch (CompletionException ce) { em = ce.getCause(); }
+
+        if (a4 == null && mx == null) {
+            throw new Exception("All compressors failed: WAP-SRC=" + (e4!=null?e4.getMessage():"null")
+                    + ", MIX=" + (em!=null?em.getMessage():"null"));
+        }
+
+        // 双跑得到监督信号：更新模型（自学习核心）
+        if (a4 != null && mx != null) {
+            modelUpdate(s, m, epsPct, mx.length, a4.length);
+        }
+
+        // 选择最小 + 平手偏向 Mix（保留你原策略）
+        byte[] best = null;
+        int bestLen = Integer.MAX_VALUE;
+        if (a4 != null && a4.length < bestLen) { best = a4; bestLen = a4.length; }
+        if (mx != null && mx.length < bestLen) { best = mx; bestLen = mx.length; }
+
+        if (a4 != null && mx != null) {
+            int min = Math.min(a4.length, mx.length);
+            int max = Math.max(a4.length, mx.length);
+            if (max <= (int)Math.ceil(min * 1.03)) {
+                return mx;
+            }
+        }
+        return best;
+    }
+
+
+    static final boolean TRACE_CI = Boolean.getBoolean("gate.traceCI");
+    static final List<CiTrace> CI_TRACE = Collections.synchronizedList(new ArrayList<CiTrace>());
+
+
+
+    /** 收集到的置信区间轨迹（副本）。 */
+    public static List<CiTrace> ciTrace() {
+        synchronized (CI_TRACE) { return new ArrayList<CiTrace>(CI_TRACE); }
+    }
+
+    /** 导出每个特征桶内的全部原始观测 x（覆盖率实验的总体）。 */
+    public static Map<String, double[]> modelSamples() {
+        Map<String, double[]> out = new LinkedHashMap<String, double[]>();
+        for (Map.Entry<BucketKey, BucketStat> e : MODEL.entrySet()) {
+            out.put(e.getKey().toString(), e.getValue().rawSamples());
+        }
+        return out;
+    }
+
+    static GateDecision modelPredict(SuggestStats s, MixProbeStats m, double epsilonPct) {
+        BucketKey key = featurize(s, m, epsilonPct);
+        BucketStat st = MODEL.get(key);
+        if (st == null) {
+            if (TRACE_CI) CI_TRACE.add(new CiTrace(key.toString(), 0, Double.NaN, Double.NaN,
+                    Double.NaN, Double.NaN, GateDecision.BOTH.name()));
+            return GateDecision.BOTH;
+        }
+
+        long n = st.count();
+        if (n < N_MIN) {
+            if (TRACE_CI) {
+                BucketSnapshot s0 = st.snapshot();
+                CI_TRACE.add(new CiTrace(key.toString(), n, s0.mean, s0.std,
+                        Double.NaN, Double.NaN, GateDecision.BOTH.name()));
+            }
+            return GateDecision.BOTH;
+        }
+
+        double[] ci = confidenceInterval(st);
+        if (ci == null) {
+            if (TRACE_CI) {
+                BucketSnapshot s0 = st.snapshot();
+                CI_TRACE.add(new CiTrace(key.toString(), n, s0.mean, s0.std,
+                        Double.NaN, Double.NaN, GateDecision.BOTH.name()));
+            }
+            return GateDecision.BOTH;
+        }
+        double lowerCI = ci[0];
+        double upperCI = ci[1];
+
+        GateDecision out;
+        if (upperCI < -DELTA_WAP) out = GateDecision.ONLY_WAP;
+        else if (lowerCI > DELTA_MIX) out = GateDecision.ONLY_MIX;
+        else out = GateDecision.BOTH;
+
+        if (TRACE_CI) {
+            BucketSnapshot s0 = st.snapshot();
+            CI_TRACE.add(new CiTrace(key.toString(), n, s0.mean, s0.std,
+                    lowerCI, upperCI, out.name()));
+        }
+        return out;
+    }
+
+    static double[] confidenceInterval(BucketStat st) {
+        if (!CI_METHOD.equals("bootstrap")) {
+            BucketSnapshot snap = st.snapshot();
+            if (snap.n < 2 || Double.isInfinite(snap.std) || Double.isNaN(snap.std) || snap.std <= 0)
+                return null;
+            double[] raw = st.rawSamples();
+            double halfWidth = halfWidth(CI_METHOD, (int) snap.n, snap.std, CONFIDENCE_LEVEL,
+                    observationRadius(raw));
+            return widenDegenerate(new double[]{snap.mean - halfWidth, snap.mean + halfWidth}, raw);
+        }
+        double[] ci = st.bootstrapCI(1.0 - CONFIDENCE_LEVEL, BOOTSTRAP_REPS,
+                0x5DEECE66DL ^ st.count());
+        if (ci == null) return null;
+        return widenDegenerate(ci, st.rawSamples());
+    }
+
+
+    static double halfWidth(String method, int n, double std, double conf) {
+        return halfWidth(method, n, std, conf, OBS_RADIUS);
+    }
+
+    static double halfWidth(String method, int n, double std, double conf, double radius) {
+        if (method.equals("student")) {
+            int df = Math.max(1, n - 1);
+            double t = new org.apache.commons.math3.distribution.TDistribution(df)
+                    .inverseCumulativeProbability(1.0 - (1.0 - conf) / 2.0);
+            return t * std / Math.sqrt(n);
+        }
+        if (method.equals("sequential")) {
+            double logTerm = Math.log(1.0 / (1.0 - conf));
+            double varN = (n > 1) ? (std * std * (n - 1)) / n : 0.0;
+            double r = (radius > 0 && !Double.isNaN(radius) && !Double.isInfinite(radius))
+                    ? radius : OBS_RADIUS;
+            return Math.sqrt(2.0 * varN * logTerm / n) + 3.0 * r * logTerm / n;
+        }
+        // normal（默认分支）
+        double z;
+        if (conf == 0.95) {
+            z = CONFIDENCE_Z;
+        } else {
+            z = new org.apache.commons.math3.distribution.NormalDistribution(0.0, 1.0)
+                    .inverseCumulativeProbability(1.0 - (1.0 - conf) / 2.0);
+        }
+        return z * std / Math.sqrt(n);
+    }
+
+    static double observationRadius(double[] xs) {
+        if (xs == null) return OBS_RADIUS;
+        double r = 0.0;
+        for (double v : xs) {
+            double a = Math.abs(v);
+            if (a > r) r = a;
+        }
+        return (r > 0) ? r : OBS_RADIUS;
+    }
+
+
+    public static double[] ciForMethod(String method, double[] xs, double conf,
+                                       int reps, long seed, boolean applyGuard) {
+        if (xs == null || xs.length < 2) return null;
+        int m = xs.length;
+        double s = 0.0;
+        for (double v : xs) s += v;
+        double mean = s / m;
+        double ss = 0.0;
+        for (double v : xs) ss += (v - mean) * (v - mean);
+        double std = Math.sqrt(Math.max(1e-12, ss / (m - 1)));
+        double[] ci;
+        if (method.equals("bootstrap")) {
+            java.util.Random rnd = new java.util.Random(seed);
+            double[] means = new double[reps];
+            double[] buf = new double[m];
+            for (int r = 0; r < reps; r++) {
+                for (int i = 0; i < m; i++) buf[i] = xs[rnd.nextInt(m)];
+                double t = 0;
+                for (int i = 0; i < m; i++) t += buf[i];
+                means[r] = t / m;
+            }
+            java.util.Arrays.sort(means);
+            ci = new double[]{BucketStat.quantile(means, (1.0 - conf) / 2.0),
+                    BucketStat.quantile(means, 1.0 - (1.0 - conf) / 2.0)};
+        } else {
+            double hw = halfWidth(method, m, std, conf, observationRadius(xs));
+            ci = new double[]{mean - hw, mean + hw};
+        }
+        if (applyGuard) return widenDegenerate(ci, xs);
+        return ci;
+    }
+
+    /**
+     * 宽度保护（供覆盖率实验成对比较使用）：区间宽度至少为观测范围的 1/3。
+     * 与 {@link #ciForMethod} 中 applyGuard=true 的分支完全等价。
+     */
+    public static double[] applyWidthGuard(double[] ci, double[] xs) {
+        if (ci == null) return null;
+        return widenDegenerate(ci, xs);
+    }
+
+
+    static double[] widenDegenerate(double[] ci, double[] xs) {
+        double min = Double.POSITIVE_INFINITY, max = Double.NEGATIVE_INFINITY;
+        for (double v : xs) { if (v < min) min = v; if (v > max) max = v; }
+        double minWidth = (max - min) / 3.0;
+        if (ci[1] - ci[0] < minWidth) {
+            double c = (ci[0] + ci[1]) / 2.0;
+            return new double[]{c - minWidth / 2.0, c + minWidth / 2.0};
+        }
+        return ci;
+    }
+
+    static void modelUpdate(SuggestStats s, MixProbeStats m, double epsilonPct, int lenMix, int lenWap) {
+        BucketKey key = featurize(s, m, epsilonPct);
+        BucketStat st = MODEL.computeIfAbsent(key, k -> new BucketStat());
+
+        double denom = Math.max(1.0, Math.min(lenMix, lenWap));
+        double x = (lenWap - lenMix) / denom;
+
+        st.update(x);
+
+        long n = st.count();
+        if (n <= 30 || (n % 100 == 0)) {
+            System.out.printf("[modelUpdate] key=%s xNorm=%.6f (wap=%d mix=%d) -> n=%d mean=%.6f std=%.6f%n",
+                    key, x, lenWap, lenMix, n, st.mean(), st.std());
+        }
+    }
+
+
+
+    public static byte[] compressMixBranch(List<Point> points, double error, int zstdLevel) throws Exception {
+        checkInput(points, error);
+        return MixCodec.compressMix(points, error, zstdLevel);
+    }
+
+    public static List<Point> decompressMixBranch(byte[] bytes) {
+        return MixCodec.decompressMix(bytes);
+    }
+
+    public static List<Point> decompressMixBranchRaw(byte[] bytes) {
+        return MixCodec.decompressMixRaw(bytes);
+    }
+
+    public static byte[] compress_WAPSRC(List<Point> points, double error, Integer wOverride) throws Exception {
+        return compress_WAPSRC(points, error, wOverride, ZSTD_LEGACY);
+    }
+
+    public static byte[] compress_WAPSRC(List<Point> points, double error, Integer wOverride, int zstdLevel) throws Exception {
+        checkInput(points, error);
+        epsilon = error;
+        lastTimeStamp = points.get(points.size() - 1).getTimestamp();
+
+        // 1. 等间隔与参数准备
+        long dt = 0;
+        if (points.size() >= 2) {
+            dt = points.get(1).getTimestamp() - points.get(0).getTimestamp();
+            for (int i = 2; i < Math.min(points.size(), 1000); i++) {
+                if (points.get(i).getTimestamp() - points.get(i - 1).getTimestamp() != dt) {
+                    throw new Exception("数据异常：非等间隔");
+                }
+            }
+        }
+
+        final double epsRes = 2.0 * epsilon;
+        final double invEpsRes = 1.0 / epsRes;
+        // 如果 suggestW 返回 maxW，则退化为全局大单窗模式（等效 GZRC）
+        final int W = (wOverride != null && wOverride > 0) ? wOverride : suggestW(points, epsilon, 0.99);
+
+        ByteArrayOutputStream recOut = new ByteArrayOutputStream();
+        int recordCount = 0;
+
+        // 状态变量
+        double phi = 0.0, P = 1e6, lambda = 0.99;
+        double lastY = 0.0; // 补丁：初始 lastY=0，使首个 Record 的 Delta 预测等效于绝对量化
+
+        long expectedNextStartTs = points.get(0).getTimestamp();
+        final int n = points.size();
+
+        for (int start = 0; start < n; ) {
+            int len = Math.min(W, n - start);
+            long startTs = points.get(start).getTimestamp();
+            double y0 = points.get(start).getValue();
+
+            boolean hasTs  = (recordCount == 0) || (startTs != expectedNextStartTs);
+            boolean hasLen = (len != W);
+
+            // --- 方案 A：AR1 预测器评估 ---
+            int q0A = (int) Math.rint((y0 - (phi * lastY)) / epsRes);
+            int q0EncA = zigZagEncode(q0A);
+            int q0ALen = uvarLen32(q0EncA);
+
+            double phiLocA = phi, PLocA = P;
+            double lastYL_A = phi * lastY + q0A * epsRes;
+            int nzA = 0, valBytesA = 0, posBytesA = 0, prevA = -1;
+            for (int i = start + 1, pos = 0; i < start + len; i++, pos++) {
+                double yhat = phiLocA * lastYL_A;
+                double e = points.get(i).getValue() - yhat;
+                int q = (int) Math.rint(e * invEpsRes);
+                if (q != 0) {
+                    nzA++;
+                    int enc = zigZagEncode(q);
+                    valBytesA += uvarLen32(enc);
+                    int gap = (prevA < 0) ? pos : (pos - prevA - 1);
+                    posBytesA += uvarLen32(gap);
+                    prevA = pos;
+                }
+                double yRecon = yhat + q * epsRes;
+                double denom = lambda + lastYL_A * PLocA * lastYL_A;
+                double K = (PLocA * lastYL_A) / denom;
+                phiLocA += K * (yRecon - yhat);
+                PLocA = (PLocA - K * lastYL_A * PLocA) / lambda;
+                lastYL_A = yRecon;
+            }
+            int maskBytesA = Math.max(0, (len - 1 + 7) / 8);
+            int bodyBytesA = (nzA == 0) ? 0 : Math.min(maskBytesA + uvarLen32(nzA) + valBytesA, uvarLen32(nzA) + posBytesA + valBytesA);
+            int totalA = (hasTs ? uvarLen64(startTs) : 0) + (hasLen ? uvarLen32(len) : 0) + 1 + q0ALen + bodyBytesA;
+
+            // --- 方案 D：DELTA 预测器评估 ---
+            int q0D = (int) Math.rint((y0 - lastY) / epsRes);
+            int q0EncD = zigZagEncode(q0D);
+            int q0DLen = uvarLen32(q0EncD);
+
+            double lastYL_D = lastY + q0D * epsRes;
+            int nzD = 0, valBytesD = 0, posBytesD = 0, prevD = -1;
+            for (int i = start + 1, pos = 0; i < start + len; i++, pos++) {
+                double yhat = lastYL_D;
+                double e = points.get(i).getValue() - yhat;
+                int q = (int) Math.rint(e * invEpsRes);
+                if (q != 0) {
+                    nzD++;
+                    int enc = zigZagEncode(q);
+                    valBytesD += uvarLen32(enc);
+                    int gap = (prevD < 0) ? pos : (pos - prevD - 1);
+                    posBytesD += uvarLen32(gap);
+                    prevD = pos;
+                }
+                double yRecon = yhat + q * epsRes;
+                lastYL_D = yRecon;
+            }
+            int bodyBytesD = (nzD == 0) ? 0 : Math.min(maskBytesA + uvarLen32(nzD) + valBytesD, uvarLen32(nzD) + posBytesD + valBytesD);
+            int totalD = (hasTs ? uvarLen64(startTs) : 0) + (hasLen ? uvarLen32(len) : 0) + 1 + q0DLen + bodyBytesD;
+
+            // 决策：谁短用谁，平手偏向 Delta (更稳)
+            boolean useDelta = (totalD <= totalA);
+
+            // --- 最终编码与状态产生 ---
+            int nz = 0, valBytes = 0, posBytes = 0, prev = -1;
+            int q0 = useDelta ? q0D : q0A;
+            int q0Enc = useDelta ? q0EncD : q0EncA;
+            ArrayList<Integer> nzPos = new ArrayList<>();
+            ArrayList<Integer> nzVals = new ArrayList<>();
+
+            double phiAfter = phi, PAfter = P, lastYAfter;
+
+            if (!useDelta) {
+                double phiLoc = phi, PLoc = P, lastYL = phi * lastY + q0 * epsRes;
+                for (int i = start + 1, pos = 0; i < start + len; i++, pos++) {
+                    double yhat = phiLoc * lastYL;
+                    int q = (int) Math.rint((points.get(i).getValue() - yhat) * invEpsRes);
+                    if (q != 0) {
+                        nz++; int enc = zigZagEncode(q);
+                        nzPos.add(pos); nzVals.add(enc);
+                        valBytes += uvarLen32(enc);
+                        int gap = (prev < 0) ? pos : (pos - prev - 1);
+                        posBytes += uvarLen32(gap); prev = pos;
+                    }
+                    double yRecon = yhat + q * epsRes;
+                    double denom = lambda + lastYL * PLoc * lastYL;
+                    double K = (PLoc * lastYL) / denom;
+                    phiLoc += K * (yRecon - yhat);
+                    PLoc = (PLoc - K * lastYL * PLoc) / lambda;
+                    lastYL = yRecon;
+                }
+                phiAfter = phiLoc; PAfter = PLoc; lastYAfter = lastYL;
+            } else {
+                double lastYL = lastY + q0 * epsRes;
+                for (int i = start + 1, pos = 0; i < start + len; i++, pos++) {
+                    double yhat = lastYL;
+                    int q = (int) Math.rint((points.get(i).getValue() - yhat) * invEpsRes);
+                    if (q != 0) {
+                        nz++; int enc = zigZagEncode(q);
+                        nzPos.add(pos); nzVals.add(enc);
+                        valBytes += uvarLen32(enc);
+                        int gap = (prev < 0) ? pos : (pos - prev - 1);
+                        posBytes += uvarLen32(gap); prev = pos;
+                    }
+                    lastYL = yhat + q * epsRes;
+                }
+                lastYAfter = lastYL;
+            }
+
+            // --- 补丁一：Mask 模式偏置（媲美 GZRC 的 Burst 效果） ---
+            int baseMode;
+            if (nz == 0) baseMode = MODE_ZERO;
+            else {
+                int maskBytes = (len - 1 + 7) / 8;
+                int bytesMask   = maskBytes + uvarLen32(nz) + valBytes;
+                int bytesSparse = uvarLen32(nz) + posBytes + valBytes;
+                // 这里的 +1 是关键，宁愿多用 1 字节也要选 Mask，因为连续 1 在 Zstd 下几乎不占空间
+                baseMode = (bytesMask <= bytesSparse + 1) ? 0 : 1;
+            }
+
+            int modeByte = (baseMode & MODE_BASE_MASK) | (useDelta ? FLAG4_PRED_DELTA : 0) | (hasTs ? FLAG4_HAS_TS : 0) | (hasLen ? FLAG4_HAS_LEN : 0);
+
+            // --- ZERO-RLE 判定 ---
+            int runWins = 1;
+            if (baseMode == MODE_ZERO && len == W && q0 == 0) {
+                double phiRun = phiAfter, PRun = PAfter, lastYRun = lastYAfter;
+                int s2 = start + W;
+                while (s2 + W <= n) {
+                    double y0_2 = points.get(s2).getValue();
+                    int q0_2 = useDelta ? (int) Math.rint((y0_2 - lastYRun) * invEpsRes) : (int) Math.rint((y0_2 - (phiRun * lastYRun)) * invEpsRes);
+                    if (q0_2 != 0) break;
+                    boolean allZero = true;
+                    if (!useDelta) {
+                        double phi2 = phiRun, P2 = PRun, ly2 = phiRun * lastYRun;
+                        for (int i = s2 + 1; i < s2 + W; i++) {
+                            double yh = phi2 * ly2;
+                            int q = (int) Math.rint((points.get(i).getValue() - yh) * invEpsRes);
+                            if (q != 0) { allZero = false; break; }
+                            double yr = yh;
+                            double den = lambda + ly2 * P2 * ly2;
+                            double K = (P2 * ly2) / den;
+                            phi2 += K * (yr - yh); P2 = (P2 - K * ly2 * P2) / lambda; ly2 = yr;
+                        }
+                        if (!allZero) break;
+                        phiRun = phi2; PRun = P2; lastYRun = ly2;
+                    } else {
+                        double ly2 = lastYRun;
+                        for (int i = s2 + 1; i < s2 + W; i++) {
+                            if ((int) Math.rint((points.get(i).getValue() - ly2) * invEpsRes) != 0) { allZero = false; break; }
+                        }
+                        if (!allZero) break;
+                        lastYRun = ly2;
+                    }
+                    runWins++; s2 += W;
+                }
+                if (runWins > 1) {
+                    modeByte |= FLAG4_ZERO_RLE;
+                    if (!useDelta) { phiAfter = phiRun; PAfter = PRun; }
+                    lastYAfter = lastYRun;
+                }
+            }
+
+            // --- 最终写入流 ---
+            recOut.write(modeByte);
+            if (hasTs) UIntEncoder.write(startTs, recOut);
+            if (hasLen) VariableByteEncoder.write(len, recOut);
+            VariableByteEncoder.write(q0Enc, recOut);
+
+            if ((modeByte & FLAG4_ZERO_RLE) != 0) {
+                VariableByteEncoder.write(runWins, recOut);
+                start += runWins * W;
+                expectedNextStartTs = startTs + (long) runWins * W * dt;
+            } else {
+                if (baseMode == 0) { // Mask
+                    int maskBytes = (len - 1 + 7) / 8;
+                    byte[] mask = new byte[maskBytes];
+                    for (int p : nzPos) setMaskBit(mask, p);
+                    recOut.write(mask);
+                    VariableByteEncoder.write(nz, recOut);
+                    for (int v : nzVals) VariableByteEncoder.write(v, recOut);
+                } else if (baseMode == 1) { // Sparse
+                    VariableByteEncoder.write(nz, recOut);
+                    int prP = -1;
+                    for (int p : nzPos) {
+                        VariableByteEncoder.write(p - prP - 1, recOut);
+                        prP = p;
+                    }
+                    for (int v : nzVals) VariableByteEncoder.write(v, recOut);
+                }
+                start += len;
+                expectedNextStartTs = startTs + (long) len * dt;
+            }
+            // 提交跨窗状态
+            if (!useDelta) { phi = phiAfter; P = PAfter; }
+            lastY = lastYAfter;
+            recordCount++;
+        }
+
+        // 组装并 Zstd 压缩
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.write(MAGIC_WAPSRC);
+        writeDouble(out, epsilon);
+        writeDouble(out, 2.0 * epsilon);
+        VariableByteEncoder.write(W, out);
+        VariableByteEncoder.write(recordCount, out);
+        UIntEncoder.write(dt, out);
+        UIntEncoder.write(lastTimeStamp, out);
+        out.write(recOut.toByteArray());
+
+        byte[] rawOut = out.toByteArray();
+        if (zstdLevel == ZSTD_LEGACY) return Zstd.compress(rawOut, ZSTD_LEVEL);
+        if (zstdLevel <= 0) return rawOut;
+        return Zstd.compress(rawOut, zstdLevel);
+    }
+
+
+
+    private static List<Point> readAR4FromRaw(byte[] raw) throws IOException {
+        ByteArrayInputStream in = new ByteArrayInputStream(raw);
+
+        // 跳过魔数
+        for (int i = 0; i < 4; i++) in.read();
+
+        double epsRes;
+        int W, numRecs;
+        long dt;
+
+        epsilon = readDouble(in);
+        epsRes = readDouble(in);
+        W = VariableByteEncoder.read(in);
+        numRecs = VariableByteEncoder.read(in);
+        dt = UIntEncoder.read(in);
+        lastTimeStamp = UIntEncoder.read(in);
+
+        List<Point> points = new ArrayList<>();
+
+        double phi = 0.0, P = 1e6, lambda = 0.99;
+        double lastY = 0.0;
+
+        long expectedStartTs = 0;
+        boolean first = true;
+
+        for (int r = 0; r < numRecs; r++) {
+            int modeRaw = in.read();
+            if (modeRaw < 0) throw new EOFException("Missing WAP-SRC record mode");
+
+            int base = (modeRaw & MODE_BASE_MASK);
+            boolean hasTs    = (modeRaw & FLAG4_HAS_TS)    != 0;
+            boolean hasLen   = (modeRaw & FLAG4_HAS_LEN)   != 0;
+            boolean zeroRle  = (modeRaw & FLAG4_ZERO_RLE)  != 0;
+            boolean predDelta= (modeRaw & FLAG4_PRED_DELTA)!= 0;
+
+            long startTs;
+            if (hasTs) {
+                startTs = UIntEncoder.read(in);
+                expectedStartTs = startTs;
+            } else {
+                if (first) throw new IOException("WAP-SRC first record must carry startTs");
+                startTs = expectedStartTs;
+            }
+            int len = hasLen ? VariableByteEncoder.read(in) : W;
+
+            int q0Enc = VariableByteEncoder.read(in);
+            int q0 = zigZagDecode(q0Enc);
+            double y0 = predDelta ? (lastY + q0 * epsRes) : (phi * lastY + q0 * epsRes);
+
+            points.add(new Point(startTs, y0));
+            lastY = y0;
+
+            if (base == MODE_ZERO) {
+                int runWins = zeroRle ? VariableByteEncoder.read(in) : 1;
+
+                // 第一窗（可能非满窗）
+                for (int pos = 0; pos < len - 1; pos++) {
+                    double yhat = predDelta ? lastY : (phi * lastY);
+                    double y = yhat; // q=0
+                    points.add(new Point(startTs + (pos + 1) * dt, y));
+                    if (!predDelta) {
+                        double denom = lambda + lastY * P * lastY;
+                        double K = (P * lastY) / denom;
+                        phi += K * (y - yhat);
+                        P = (P - K * lastY * P) / lambda;
+                    }
+                    lastY = y;
+                }
+                // 后续 RLE 窗（都是满窗 W）
+                for (int w = 1; w < runWins; w++) {
+                    long ts0 = startTs + (long) w * W * dt;
+                    double y0w = predDelta ? lastY : (phi * lastY); // q0=0
+                    points.add(new Point(ts0, y0w));
+                    lastY = y0w;
+                    for (int pos = 0; pos < W - 1; pos++) {
+                        double yhat = predDelta ? lastY : (phi * lastY);
+                        double y = yhat;
+                        points.add(new Point(ts0 + (pos + 1) * dt, y));
+                        if (!predDelta) {
+                            double denom = lambda + lastY * P * lastY;
+                            double K = (P * lastY) / denom;
+                            phi += K * (y - yhat);
+                            P = (P - K * lastY * P) / lambda;
+                        }
+                        lastY = y;
+                    }
+                }
+                expectedStartTs = startTs + (long) runWins * W * dt;
+
+            } else if (base == 0) { // 掩码
+                int maskBytes = Math.max(0, (len - 1 + 7) / 8);
+                byte[] mask = new byte[maskBytes];
+                if (maskBytes > 0) {
+                    int read = in.read(mask);
+                    if (read != maskBytes) throw new EOFException("Mask truncated");
+                }
+                int nzCount = VariableByteEncoder.read(in);
+                int[] nzVals = new int[nzCount];
+                for (int i2 = 0; i2 < nzCount; i2++) nzVals[i2] = VariableByteEncoder.read(in);
+                int nzIdx = 0;
+
+                for (int pos = 0; pos < len - 1; pos++) {
+                    double yhat = predDelta ? lastY : (phi * lastY);
+                    int q = getMaskBit(mask, pos) ? zigZagDecode(nzVals[nzIdx++]) : 0;
+                    double y = yhat + q * epsRes;
+                    points.add(new Point(startTs + (pos + 1) * dt, y));
+                    if (!predDelta) {
+                        double denom = lambda + lastY * P * lastY;
+                        double K = (P * lastY) / denom;
+                        phi += K * (y - yhat);
+                        P = (P - K * lastY * P) / lambda;
+                    }
+                    lastY = y;
+                }
+                expectedStartTs = startTs + (long) len * dt;
+
+            } else if (base == 1) { // 稀疏
+                int nzCount = VariableByteEncoder.read(in);
+                int[] nzPos = new int[nzCount];
+                int prev = -1;
+                for (int i2 = 0; i2 < nzCount; i2++) {
+                    int gap = VariableByteEncoder.read(in);
+                    int p = prev + gap + 1;
+                    nzPos[i2] = p;
+                    prev = p;
+                }
+                int[] nzVals = new int[nzCount];
+                for (int i2 = 0; i2 < nzCount; i2++) nzVals[i2] = VariableByteEncoder.read(in);
+
+                int nzIdx = 0;
+                for (int pos = 0; pos < len - 1; pos++) {
+                    double yhat = predDelta ? lastY : (phi * lastY);
+                    int q = 0;
+                    if (nzIdx < nzCount && nzPos[nzIdx] == pos) {
+                        q = zigZagDecode(nzVals[nzIdx++]);
+                    }
+                    double y = yhat + q * epsRes;
+                    points.add(new Point(startTs + (pos + 1) * dt, y));
+                    if (!predDelta) {
+                        double denom = lambda + lastY * P * lastY;
+                        double K = (P * lastY) / denom;
+                        phi += K * (y - yhat);
+                        P = (P - K * lastY * P) / lambda;
+                    }
+                    lastY = y;
+                }
+                expectedStartTs = startTs + (long) len * dt;
+
+            } else {
+                throw new IOException("Unknown WAP-SRC base mode: " + base);
+            }
+
+            first = false;
+        }
+        in.close();
+        return points;
+    }
+
+
+
+
+
+
+    private static void writeDouble(OutputStream out, double v) throws IOException {
+        long bits = Double.doubleToRawLongBits(v);
+        out.write((int)((bits >>> 56) & 0xFF));
+        out.write((int)((bits >>> 48) & 0xFF));
+        out.write((int)((bits >>> 40) & 0xFF));
+        out.write((int)((bits >>> 32) & 0xFF));
+        out.write((int)((bits >>> 24) & 0xFF));
+        out.write((int)((bits >>> 16) & 0xFF));
+        out.write((int)((bits >>> 8)  & 0xFF));
+        out.write((int)(bits & 0xFF));
+    }
+    private static double readDouble(InputStream in) throws IOException {
+        long bits = 0L;
+        for (int i = 7; i >= 0; i--) {
+            int b = in.read();
+            if (b < 0) throw new EOFException("Unexpected EOF reading double");
+            bits |= ((long) (b & 0xFF)) << (i * 8);
+        }
+        return Double.longBitsToDouble(bits);
+    }
+
+    // 封装一处 Zstd 解压，优先用帧内尺寸，未知时退回倍率
+    private static byte[] zstdDecompress(byte[] input) {
+        long sz = Zstd.decompressedSize(input);
+        int cap;
+        if (sz > 0 && sz <= Integer.MAX_VALUE) cap = (int) sz;
+        else cap = Math.max(1024, input.length * 8); // 保守倍数
+        return Zstd.decompress(input, cap);
+    }
+
+
+    // 位操作小工具
+    private static void setMaskBit(byte[] mask, int pos) {
+        int bi = pos >> 3, bo = pos & 7;
+        mask[bi] |= (byte) (1 << bo);
+    }
+    private static boolean getMaskBit(byte[] mask, int pos) {
+        int bi = pos >> 3, bo = pos & 7;
+        return (((mask[bi] & 0xFF) >>> bo) & 1) != 0;
+    }
+   // private static final byte[] MAGIC_ARM3 = new byte[]{'A','R','M','3'};
+
+    /**
+     * Sparse-series shortcut: returns the maximum window length when the
+     * estimated nonzero-residual rate is low enough that window search cannot
+     * pay off, or null when the cost model must be evaluated.
+     */
+    private static Integer sparseFastPathW(List<Point> pts, double epsilon, double lambda) {
+        double rho = lag1Rho(pts, 4096);
+        double Lr = (rho > 0) ? 1.0 / (1.0 - Math.min(0.999, rho)) : 1.0;
+        double Lλ = 1.0 / (1.0 - lambda);
+        double L = Math.max(Lr, Lλ);
+
+        int n = pts.size();
+        int maxW = Math.max(MIN_W, align128Down(n));
+
+        int Wprobe = Math.min(131_072, n);
+        double nzRateRls   = estimateNzRate(pts, epsilon, Wprobe, lambda);
+        double nzRateDelta = estimateNzRateDelta(pts, epsilon, Math.min(200_000, n));
+        if ((nzRateRls >= 0 && nzRateRls < SPARSE_NZRATE * 2) ||   // 放宽到 0.2%
+                nzRateDelta < 0.02 ||                                 // Delta 非零率 < 2%
+                (nzRateDelta < 0.05 && n >= 200_000)) {               // 大序列稍微放宽
+            return maxW;
+        }
+        return null;
+    }
+
+    /** Read-only accessor: true when suggestW() bypasses the cost model. */
+    public static boolean fastPathForTest(List<Point> pts, double epsilon, double lambda) {
+        if (pts == null || pts.size() < 300) return true;
+        long[] dtBox = new long[1];
+        if (!quasiEvenlySpaced(pts, 0.98, 4096, dtBox)) return true;
+        return sparseFastPathW(pts, epsilon, lambda) != null;
+    }
+
+    static int suggestW(List<Point> pts, double epsilon, double lambda) {
+        if (pts == null || pts.size() < 300) return MIN_W;
+
+        long[] dtBox = new long[1];
+        if (!quasiEvenlySpaced(pts, 0.98, 4096, dtBox)) return MIN_W;
+
+        Integer fastW = sparseFastPathW(pts, epsilon, lambda);
+        if (fastW != null) return fastW;
+
+        int n = pts.size();
+        int maxW = Math.max(MIN_W, align128Down(n));
+
+        // 粗搜索并发
+        List<Integer> coarse = buildCandidates(n);
+        WBpp best = null;
+        best = evaluateAndUpdateBestConcurrent(pts, epsilon, lambda, coarse, best);
+
+        // 局部细化并发
+        // Algorithm 3 细化阶段的 invariant：所有候选 W 必须 >= MIN_W。
+        // 该下界在 buildRefineCandidates 内以 max(W_min, ·) 显式施加，
+        // 行为与修订前完全一致（不改变候选集合，仅使不变式显式可测）。
+        List<Integer> refine = buildRefineCandidates(n, best != null ? best.W : MIN_W);
+        best = evaluateAndUpdateBestConcurrent(pts, epsilon, lambda, refine, best);
+
+        // 谷底保护区并发（仅在可信区间内独立取最优）
+        List<Integer> trusted = new ArrayList<>();
+        for (int W = MIN_W; W <= Math.min(VALLEY_GUARD_MAX_W, maxW); W += 256) trusted.add(W);
+        WBpp trustBest = evaluateBestOnlyConcurrent(pts, epsilon, lambda, trusted);
+
+        if (best == null) {
+            // 粗搜索全部失败：回退到保守最小窗口（Algorithm 3 的 n<300 早退分支同样返回 MIN_W）
+            return MIN_W;
+        }
+
+        if (trustBest != null && trustBest.bpp + 1e-12 < best.bpp * (1.0 - VALLEY_GUARD_MARGIN)) {
+            return Math.max(MIN_W, Math.min(trustBest.W, maxW));
+        }
+        // Algorithm 3 细化阶段的 invariant: 永不返回 < MIN_W
+        return Math.max(MIN_W, Math.min(best.W, maxW));
+    }
+
+
+    /**
+     * Public accessor for the order-independent selection rule, used by
+     * {@code TestSelectionDeterminism} to assert that the winner does not
+     * depend on the order in which candidate results are merged.
+     */
+    public static WBpp selectBestForTest(List<WBpp> results) {
+        return selectBest(results);
+    }
+
+    // 几何级候选，最小 128，上限自动到 n（向下 128 对齐）
+    static List<Integer> buildCandidates(int n) {
+        int maxW = Math.max(MIN_W, align128Down(n));
+        ArrayList<Integer> list = new ArrayList<>();
+        if (maxW <= MIN_W) { list.add(maxW); return list; }
+
+        long W = align128Up(MIN_W);
+        int last = -1;
+        while (W < maxW) {
+            if ((int)W != last) list.add((int)W);
+            last = (int)W;
+            long next = (long) Math.ceil(W * 1.6);               // 几何步进（1.6）
+            if (next <= W) break;
+            W = align128Up((int)Math.min(next, maxW));
+        }
+        if (list.isEmpty() || list.get(list.size() - 1) != maxW) list.add(maxW); // 包含最大
+        return list;
+    }
+
+
+    // 围绕 bestW 局部细化（步长随 W 缩放）
+    // Algorithm 3 细化阶段: R = {W in [max(MIN_W, W_c - 16s), min(W_max, W_c + 16s)] step s} ∪ {W_max}
+    // 下界必须显式 clamp 到 MIN_W：halfSpan = step*16，当 bestW < 2048 时 W_c - 16s 可能为负。
+    /** Minimum admissible window length. Exposed for the window-guard unit test. */
+    public static int minWindow() { return MIN_W; }
+
+    /** Read-only access to the window cost model, used by the R1.13 cost-model validation. */
+    public static double estimatedBppForTest(List<Point> pts, double epsilon, double lambda, int W) {
+        return estimateBppForW(pts, epsilon, lambda, W);
+    }
+
+    /** Read-only access to the coarse candidate grid, used by the R1.13 cost-model validation. */
+    public static java.util.List<Integer> coarseCandidatesForTest(int n) {
+        return buildCandidates(n);
+    }
+
+    /**
+     * Public accessor for the refine-stage candidate set, used by
+     * {@code TestAlgorithm3WindowGuard} to assert the Algorithm 3 refinement-step
+     * invariant that every candidate window length is at least {@code MIN_W}.
+     */
+    public static java.util.List<Integer> refineCandidatesForTest(int n, int bestW) {
+        return buildRefineCandidates(n, bestW);
+    }
+
+    /**
+     * Public accessor for the window-configuration entry point, used by
+     * {@code TestAlgorithm3WindowGuard} to assert that the selected window
+     * length is always at least {@code MIN_W}.
+     */
+    public static int suggestWindowForTest(List<Point> pts, double epsilon, double lambda) {
+        return suggestW(pts, epsilon, lambda);
+    }
+
+    static List<Integer> buildRefineCandidates(int n, int bestW) {
+        int maxW = Math.max(MIN_W, align128Down(n));
+        int step = Math.max(align128Up(bestW / 64), MIN_W); // 动态步长，最小 128
+        int halfSpan = step * 16;
+        // 显式下界保护：Algorithm 3 细化阶段的 invariant —— 候选 W >= MIN_W
+        int low  = Math.max(MIN_W, bestW - halfSpan);
+        int high = Math.min(maxW, bestW + halfSpan);
+
+        LinkedHashSet<Integer> set = new LinkedHashSet<>();
+        for (int W = align128Down(low); W <= high; W += step) set.add(W);
+        set.add(maxW);
+        ArrayList<Integer> list = new ArrayList<>(set);
+        Collections.sort(list);
+        return list;
+    }
+
+    // 采样计算值域（避免全量扫描大数据集）
+    private static double computeValueRange(List<Point> pts) {
+        int n = pts.size();
+        int step = Math.max(1, n / 10000);
+        double min = Double.POSITIVE_INFINITY, max = Double.NEGATIVE_INFINITY;
+        for (int i = 0; i < n; i += step) {
+            double v = pts.get(i).getValue();
+            // 非有限值（NaN / ±Inf）不得进入尺度：NaN 会污染 min/max，
+            // ±Inf 会把值域变成无穷大，从而使 epsilon 的相对刻度失去意义。
+            if (!Double.isFinite(v)) continue;
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+        if (!Double.isFinite(min) || !Double.isFinite(max)) return 1e-9;
+        return Math.max(1e-9, max - min);
+    }
+
+    /**
+     * 门控分桶所用的尺度。默认 "range" = 峰值区间（历史行为，逐字节不变）；
+     * "robust" = 1%..99% 截尾区间，对少数全局极值不敏感。
+     */
+    private static double computeEpsScale(List<Point> pts) {
+        if ("robust".equals(EPS_SCALE_MODE)) {
+            double t = EpsScale.compute(pts, EpsScale.Mode.TRIMMED).value;
+            if (Double.isFinite(t) && t > 0) return t;
+        }
+        return computeValueRange(pts);
+    }
+
+    /**
+     * 与 compress_WAPSRC 共享的窗口成本估计器：AR1 vs Delta 二选一。
+     * 更新 phi/P/lastY 为获胜模式的窗末状态（通过数组引用传递）。
+     * bodyOut[0] 接收 body-only 字节数（供大 W 外推使用）。
+     * @return 该窗预估总字节数（header + body）
+     */
+    private static long estimateWindowBytes(
+            List<Point> pts, int start, int len, double epsilon,
+            double[] phi, double[] P, double[] lastY,
+            boolean hasTs, boolean hasLen, long[] bodyOut) {
+        final double epsRes = 2.0 * epsilon;
+        final double invEpsRes = 1.0 / epsRes;
+        final double lambda = 0.99;
+        double y0 = pts.get(start).getValue();
+
+        // ---- AR1 ----
+        int q0A = (int) Math.rint((y0 - (phi[0] * lastY[0])) / epsRes);
+        int q0ALen = uvarLen32(zigZagEncode(q0A));
+        double phiA = phi[0], PA = P[0];
+        double lyA = phi[0] * lastY[0] + q0A * epsRes;
+        int nzA = 0, valBA = 0, posBA = 0, prevA = -1;
+        for (int i = start + 1, pos = 0; i < start + len; i++, pos++) {
+            double yh = phiA * lyA;
+            int q = (int) Math.rint((pts.get(i).getValue() - yh) * invEpsRes);
+            if (q != 0) { nzA++; int e = zigZagEncode(q); valBA += uvarLen32(e);
+                posBA += uvarLen32((prevA < 0) ? pos : (pos - prevA - 1)); prevA = pos; }
+            double yr = yh + q * epsRes;
+            double dn = lambda + lyA * PA * lyA, K = (PA * lyA) / dn;
+            phiA += K * (yr - yh); PA = (PA - K * lyA * PA) / lambda; lyA = yr;
+        }
+        int maskB = Math.max(0, (len - 1 + 7) / 8);
+        int bodyA = (nzA == 0) ? 0 : (maskB + uvarLen32(nzA) + valBA <= uvarLen32(nzA) + posBA + valBA + 1)
+                ? (maskB + uvarLen32(nzA) + valBA) : (uvarLen32(nzA) + posBA + valBA);
+        long totalA = (long)((hasTs ? uvarLen64(pts.get(start).getTimestamp()) : 0)
+                + (hasLen ? uvarLen32(len) : 0) + 1 + q0ALen) + bodyA;
+
+        // ---- Delta ----
+        int q0D = (int) Math.rint((y0 - lastY[0]) / epsRes);
+        int q0DLen = uvarLen32(zigZagEncode(q0D));
+        double lyD = lastY[0] + q0D * epsRes;
+        int nzD = 0, valBD = 0, posBD = 0, prevD = -1;
+        for (int i = start + 1, pos = 0; i < start + len; i++, pos++) {
+            double yh = lyD;
+            int q = (int) Math.rint((pts.get(i).getValue() - yh) * invEpsRes);
+            if (q != 0) { nzD++; int e = zigZagEncode(q); valBD += uvarLen32(e);
+                posBD += uvarLen32((prevD < 0) ? pos : (pos - prevD - 1)); prevD = pos; }
+            lyD = yh + q * epsRes;
+        }
+        int bodyD = (nzD == 0) ? 0 : (maskB + uvarLen32(nzD) + valBD <= uvarLen32(nzD) + posBD + valBD + 1)
+                ? (maskB + uvarLen32(nzD) + valBD) : (uvarLen32(nzD) + posBD + valBD);
+        long totalD = (long)((hasTs ? uvarLen64(pts.get(start).getTimestamp()) : 0)
+                + (hasLen ? uvarLen32(len) : 0) + 1 + q0DLen) + bodyD;
+
+        if (totalA <= totalD) {
+            phi[0] = phiA; P[0] = PA; lastY[0] = lyA;
+            bodyOut[0] = bodyA;
+            return totalA;
+        } else {
+            lastY[0] = lyD;
+            bodyOut[0] = bodyD;
+            return totalD;
+        }
+    }
+
+    static EvalAgg evalPhase(List<Point> pts, double epsilon, double lambda, int W, int phase, int samplesBudget, int pointsBudget) {
+        final double epsRes = 2.0 * epsilon;
+        final double invEpsRes = 1.0 / epsRes;
+        EvalAgg ag = new EvalAgg();
+        int n = pts.size();
+
+        if (phase < 0) phase = 0;
+        if (phase >= W) phase = phase % W;
+
+        int totalWins = (n > phase) ? ((n - phase + W - 1) / W) : 0;
+        if (totalWins <= 0) return ag;
+
+        int samples = Math.min(MAX_SAMPLES, Math.max(1, samplesBudget));
+        samples = Math.min(samples, totalWins);
+        int step = Math.max(1, totalWins / samples);
+
+        long usedPoints = 0L;
+        for (int wi = 0, s = 0; wi < totalWins && s < samples; wi += step, s++) {
+            int start = phase + wi * W;
+            if (start >= n) break;
+            int len = Math.min(W, n - start);
+            if (len <= 0) continue;
+
+            if (usedPoints + len > pointsBudget) break;
+
+            int startTsB = uvarLen64(pts.get(start).getTimestamp());
+            int lenB = uvarLen32(len);
+            ag.bytesHeader += startTsB + lenB + 8 + 1;
+            ag.startTsBytesSum += startTsB;
+            ag.lenBytesSum += lenB;
+            ag.sampled++;
+
+            double phi = 0.0, P = 1e6;
+            double lastY = pts.get(start).getValue();
+
+            int nz = 0, valBytes = 0, posBytes = 0;
+            int prevPos = -1;
+
+            for (int i = start + 1, pos = 0; i < start + len; i++, pos++) {
+                double yhat = phi * lastY;
+                double e = pts.get(i).getValue() - yhat;
+                int q = (int) Math.rint(e * invEpsRes);
+                if (q != 0) {
+                    nz++;
+                    int enc = zigZagEncode(q);
+                    valBytes += uvarLen32(enc);
+                    int gap = (prevPos < 0) ? pos : (pos - prevPos - 1);
+                    posBytes += uvarLen32(gap);
+                    prevPos = pos;
+                }
+                double yRecon = yhat + q * epsRes;
+
+                double denom = lambda + lastY * P * lastY;
+                double K = (P * lastY) / denom;
+                phi += K * (yRecon - yhat);
+                P = (P - K * lastY * P) / lambda;
+                lastY = yRecon;
+            }
+
+            int maskBytes = Math.max(0, (len - 1 + 7) / 8);
+            int bodyBytes;
+            if (nz == 0) {
+                bodyBytes = 0;
+            } else {
+                int bytesMask   = maskBytes + uvarLen32(nz) + valBytes;
+                int bytesSparse = uvarLen32(nz) + posBytes + valBytes;
+                bodyBytes = Math.min(bytesMask, bytesSparse);
+            }
+
+            ag.bytesBody += bodyBytes;
+            ag.ptsCount += len;
+            usedPoints += len;
+        }
+        return ag;
+    }
+
+    static double exactBppForW(List<Point> pts, double epsilon, double lambda, int W) {
+        final double epsRes = 2.0 * epsilon;
+        final double invEpsRes = 1.0 / epsRes;
+        int n = pts.size();
+        int numWindows = (n + W - 1) / W;
+
+        long bytesHeader = 0, bytesBody = 0, ptsCount = 0;
+
+        for (int wi = 0; wi < numWindows; wi++) {
+            int start = wi * W;
+            int len = Math.min(W, n - start);
+            if (len <= 0) continue;
+
+            int startTsB = uvarLen64(pts.get(start).getTimestamp());
+            int lenB = uvarLen32(len);
+            bytesHeader += startTsB + lenB + 8 + 1;
+
+            double phi = 0.0, P = 1e6;
+            double lastY = pts.get(start).getValue();
+
+            int nz = 0, valBytes = 0, posBytes = 0;
+            int prevPos = -1;
+
+            for (int i = start + 1, pos = 0; i < start + len; i++, pos++) {
+                double yhat = phi * lastY;
+                double e = pts.get(i).getValue() - yhat;
+                int q = (int) Math.rint(e * invEpsRes);
+                if (q != 0) {
+                    nz++;
+                    int enc = zigZagEncode(q);
+                    valBytes += uvarLen32(enc);
+                    int gap = (prevPos < 0) ? pos : (pos - prevPos - 1);
+                    posBytes += uvarLen32(gap);
+                    prevPos = pos;
+                }
+                double yRecon = yhat + q * epsRes;
+
+                double denom = lambda + lastY * P * lastY;
+                double K = (P * lastY) / denom;
+                phi += K * (yRecon - yhat);
+                P = (P - K * lastY * P) / lambda;
+                lastY = yRecon;
+            }
+
+            int maskBytes = Math.max(0, (len - 1 + 7) / 8);
+            int bodyBytes;
+            if (nz == 0) {
+                bodyBytes = 0;
+            } else {
+                int bytesMask   = maskBytes + uvarLen32(nz) + valBytes;
+                int bytesSparse = uvarLen32(nz) + posBytes + valBytes;
+                bodyBytes = Math.min(bytesMask, bytesSparse);
+            }
+
+            bytesBody += bodyBytes;
+            ptsCount += len;
+        }
+
+        if (ptsCount == 0) return Double.POSITIVE_INFINITY;
+        return (bytesHeader + bytesBody) / (double) ptsCount;
+    }
+
+
+    static double estimateNzRate(List<Point> pts, double epsilon, int Wprobe, double lambda) {
+        if (pts == null || pts.size() < 2) return 0.0;
+
+        final double epsRes = 2.0 * epsilon;
+        final double invEpsRes = 1.0 / epsRes;
+        int n = pts.size();
+        int numWindows = (n + Wprobe - 1) / Wprobe;
+        int samples = Math.min(12, Math.max(3, numWindows));
+        int step = Math.max(1, (int) Math.ceil(numWindows / (double) samples));
+
+        long posCount = 0L;
+        long nzCount = 0L;
+
+        for (int w = 0, s = 0; w < numWindows && s < samples; w += step, s++) {
+            int start = w * Wprobe, end = Math.min(n, start + Wprobe);
+            int len = end - start;
+            if (len <= 1) continue;
+
+            double phi = 0.0, P = 1e6;
+            double lastY = pts.get(start).getValue();
+
+            for (int i = start + 1; i < end; i++) {
+                double yhat = phi * lastY;
+                double e = pts.get(i).getValue() - yhat;
+                int q = (int) Math.rint(e * invEpsRes);
+                if (q != 0) nzCount++;
+
+                double yRecon = yhat + q * epsRes;
+                double denom = 0.99 + lastY * P * lastY;     // 原实现保持
+                double K = (P * lastY) / denom;
+                phi += K * (yRecon - yhat);
+                P = (P - K * lastY * P) / 0.99;              // 原实现保持
+                lastY = yRecon;
+            }
+            posCount += (len - 1);
+        }
+        return posCount > 0 ? (nzCount / (double) posCount) : 0.0;
+    }
+
+    static double estimateBppForW(List<Point> pts, double epsilon, double lambda, int W) {
+        int n = pts.size();
+        int numWindows = (n + W - 1) / W;
+        if (numWindows <= 2) {
+            return exactBppForW(pts, epsilon, lambda, W);
+        }
+
+        final int samplesBudget = MAX_SAMPLES;
+        final int pointsBudget  = MAX_EVAL_POINTS;
+
+        if (W <= EVAL_W_CAP) {
+            int[] phases = {0, W / 2};
+            long bytesHeader = 0, bytesBody = 0, ptsCount = 0;
+            for (int ph : phases) {
+                EvalAgg ag = evalPhase(pts, epsilon, lambda, W, ph, samplesBudget, pointsBudget / phases.length);
+                bytesHeader += ag.bytesHeader;
+                bytesBody   += ag.bytesBody;
+                ptsCount    += ag.ptsCount;
+            }
+            if (ptsCount == 0) return Double.POSITIVE_INFINITY;
+            return (bytesHeader + bytesBody) / (double) ptsCount;
+        } else {
+            int Wcap = EVAL_W_CAP;
+            int[] phases = {0, Wcap / 2};
+            long bytesHeader = 0, bodyBytes = 0, ptsCount = 0;
+            long startTsBytesSum = 0, lenBytesSum = 0;
+            int sampled = 0;
+
+            for (int ph : phases) {
+                EvalAgg ag = evalPhase(pts, epsilon, lambda, Wcap, ph, samplesBudget, pointsBudget / phases.length);
+                bytesHeader += ag.bytesHeader;
+                bodyBytes   += ag.bytesBody;
+                ptsCount    += ag.ptsCount;
+                startTsBytesSum += ag.startTsBytesSum;
+                lenBytesSum += ag.lenBytesSum;
+                sampled += ag.sampled;
+            }
+            if (ptsCount == 0 || sampled == 0) return Double.POSITIVE_INFINITY;
+
+            double bodyBpp = bodyBytes / (double) ptsCount;
+            double avgStartTsBytes = startTsBytesSum / (double) sampled;
+            int lenBytesW = uvarLen32(W);
+            double headerPerWin = avgStartTsBytes + 8 + 1 + lenBytesW;
+            double headerBpp = headerPerWin / (double) W;
+            return headerBpp + bodyBpp;
+        }
+    }
+
+    // 准等间隔：>=ratio 的间隔相同。outDt[0] 返回众数 dt（便于其他地方使用）
+    static boolean quasiEvenlySpaced(List<Point> pts, double ratio, int maxCheck, long[] outDt) {
+        int m = Math.min(pts.size() - 1, Math.max(0, maxCheck));
+        if (m <= 0) return false;
+        HashMap<Long,Integer> freq = new HashMap<>();
+        for (int i = 1; i <= m; i++) {
+            long d = pts.get(i).getTimestamp() - pts.get(i - 1).getTimestamp();
+            freq.put(d, freq.getOrDefault(d, 0) + 1);
+        }
+        int total = 0, best = 0; long bestDt = 0;
+        for (Map.Entry<Long,Integer> e : freq.entrySet()) {
+            total += e.getValue();
+            if (e.getValue() > best) { best = e.getValue(); bestDt = e.getKey(); }
+        }
+        if (outDt != null && outDt.length > 0) outDt[0] = bestDt;
+        return best >= Math.ceil(ratio * total);
+    }
+
+
+    // lag-1 自相关（原实现保持）
+    static double lag1Rho(List<Point> pts, int maxN) {
+        int m = Math.min(pts.size(), Math.max(3, maxN));
+        if (m < 3) return 0.0;
+        double sum = 0, sum2 = 0;
+        for (int i = 0; i < m; i++) {
+            double y = pts.get(i).getValue();
+            sum += y; sum2 += y * y;
+        }
+        double mean = sum / m;
+        double var = sum2 / m - mean * mean;
+        if (var <= 0) return 0.0;
+
+        double cov = 0.0;
+        for (int i = 1; i < m; i++) {
+            double y0 = pts.get(i - 1).getValue() - mean;
+            double y1 = pts.get(i).getValue() - mean;
+            cov += y0 * y1;
+        }
+        cov /= (m - 1);
+        double rho = cov / var;
+        if (rho > 0.9999) rho = 0.9999;
+        if (rho < -0.9999) rho = -0.9999;
+        return rho;
+    }
+
+    static int uvarLen32(int v) {
+        // v 来自 zigzag 等，非负。0->1B，其余按位长/7 上取整
+        if (v == 0) return 1;
+        int bits = 32 - Integer.numberOfLeadingZeros(v);
+        return (bits + 6) / 7;
+    }
+    static int uvarLen64(long v) {
+        if (v == 0L) return 1;
+        int bits = 64 - Long.numberOfLeadingZeros(v);
+        return (bits + 6) / 7;
+    }
+
+
+    public static List<Point> decompress(byte[] binary) {
+        try {
+            if (binary != null && binary.length >= 4
+                    && binary[0]=='M' && binary[1]=='I' && binary[2]=='X' && binary[3]=='1') {
+                byte[] inner = new byte[binary.length - 4];
+                System.arraycopy(binary, 4, inner, 0, inner.length);
+                return MixCodec.decompressMix(inner);
+            }
+            byte[] raw = zstdDecompress(binary);
+            if (raw[0]=='A' && raw[1]=='R' && raw[2]=='M' && raw[3]=='4') {
+                return readAR4FromRaw(raw);
+            }
+
+            return null;
+        } catch (Exception e) {
+            e.printStackTrace();
+            return Collections.emptyList();
+        }
+    }
+
+
+    public static List<Point> decompressRaw(byte[] binary) {
+        try {
+            if (binary != null && binary.length >= 4
+                    && binary[0]=='M' && binary[1]=='I' && binary[2]=='X' && binary[3]=='1') {
+                byte[] inner = new byte[binary.length - 4];
+                System.arraycopy(binary, 4, inner, 0, inner.length);
+                return MixCodec.decompressMixRaw(inner);
+            }
+            if (binary != null && binary.length >= 4
+                    && binary[0]=='A' && binary[1]=='R' && binary[2]=='M' && binary[3]=='4') {
+                return readAR4FromRaw(binary);
+            }
+            return null;
+        } catch (Exception e) {
+            e.printStackTrace();
+            return Collections.emptyList();
+        }
+    }
+
+
+    static double estimateNzRateDelta(List<Point> pts, double epsilon, int budgetPoints) {
+        if (pts == null || pts.size() < 2) return 0.0;
+        final double epsRes = 2.0 * epsilon;
+        final double invEpsRes = 1.0 / epsRes;
+        final int n = pts.size();
+        final int m = Math.min(n - 1, Math.max(10_000, Math.min(200_000, budgetPoints)));
+        long nz = 0, tot = 0;
+        int stride = Math.max(1, (n - 1) / m);
+        for (int i = 1; i < n; i += stride) {
+            double diff = pts.get(i).getValue() - pts.get(i - 1).getValue();
+            int q = (int)Math.rint(diff * invEpsRes);
+            if (q != 0) nz++;
+            tot++;
+        }
+        return tot > 0 ? (nz / (double)tot) : 0.0;
+    }
+
+
+
+}
